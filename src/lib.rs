@@ -16,7 +16,6 @@ use std::collections::{HashMap, HashSet};
 use timely::*;
 use timely::dataflow::*;
 use timely::dataflow::scopes::{Root, Child};
-use timely::dataflow::operators::probe::{Handle};
 use timely::progress::timestamp::{Timestamp, RootTimestamp};
 use timely::progress::nested::product::Product;
 
@@ -61,7 +60,6 @@ pub enum Predicate { LT, GT, LTE, GTE, EQ, NEQ }
 #[derive(Deserialize, Clone, Debug)]
 pub enum AggregationFn { MIN, MAX, COUNT }
 
-type ProbeHandle<T> = Handle<Product<RootTimestamp, T>>;
 type TraceKeyHandle<K, T, R> = TraceAgent<K, (), T, R, OrdKeySpine<K, T, R>>;
 type TraceValHandle<K, V, T, R> = TraceAgent<K, V, T, R, OrdValSpine<K, V, T, R>>;
 type Arrange<G: Scope, K, V, R> = Arranged<G, K, V, R, TraceValHandle<K, V, G::Timestamp, R>>;
@@ -95,10 +93,11 @@ struct ImplContext<G: Scope + ScopeParent> where G::Timestamp : Lattice {
     // variable_map: RelationMap<'a, G>,
 }
 
+// @TODO move input_handle into server, get rid of all this and use DB
+// struct directly
 pub struct Context<T: Timestamp+Lattice> {
     pub input_handle: InputSession<T, Datom, isize>,
     pub db: DB<T>,
-    pub probes: Vec<ProbeHandle<T>>,
     pub queries: QueryMap<T, isize>,
 }
 

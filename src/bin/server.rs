@@ -18,12 +18,11 @@ extern crate abomonation;
 extern crate serde_derive;
 
 use std::collections::{HashMap};
-use std::io::{Write};
 use std::time::{Instant, Duration};
 use std::usize;
 
-use timely::dataflow::operators::Probe;
-use timely::dataflow::operators::Map;
+use timely::dataflow::operators::{Probe, Map, Operator};
+use timely::dataflow::operators::generic::{OutputHandle};
 
 use mio::*;
 use mio::net::{TcpListener};
@@ -43,6 +42,9 @@ struct Command {
     // the worker (typically a controller) that issued this command
     // and is the one that should receive outputs
     owner: usize,
+    // the client token that issued the command (only relevant to the
+    // owning worker, no one else has the connection)
+    client: usize,
     cmd: String,
 }
 
@@ -54,6 +56,7 @@ enum Request {
 }
 
 const SERVER: Token = Token(usize::MAX - 1);
+const RESULTS: Token = Token(usize::MAX - 2);
 
 fn main() {
 
@@ -64,14 +67,13 @@ fn main() {
         // setup interpreter context
         let mut ctx = worker.dataflow(|scope| {
             let (input_handle, db) = setup_db(scope);
-            
-            Context {
-                db,
-                input_handle,
-                probes: Vec::new(),
-                queries: HashMap::new(),
-            }
+
+            Context { db, input_handle, queries: HashMap::new(), }
         });
+        let mut probes = Vec::new();
+
+        // mapping from query names to interested client tokens
+        let mut interests: HashMap<String, Vec<Token>> = HashMap::new();
 
         // setup serialized command queue (shared between all workers)
         let mut sequencer: Sequencer<Command> = Sequencer::new(worker, Instant::now());
@@ -81,16 +83,21 @@ fn main() {
             max_connections: 1024,
             .. ws::Settings::default()
         };
+
+        // setup results channel
+        let (send_results, recv_results) = mio::channel::channel();
         
-        // setup networking event polling
+        // setup server socket
         let addr = "127.0.0.1:6262".parse().unwrap();
         let server = TcpListener::bind(&addr).unwrap();
-        let poll = Poll::new().unwrap();
         let mut connections = Slab::with_capacity(ws_settings.max_connections);
         let mut next_connection_id: u32 = 0;
+
+        // setup event loop
+        let poll = Poll::new().unwrap();
         let mut events = Events::with_capacity(1024);
 
-        // start listening
+        poll.register(&recv_results, RESULTS, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         poll.register(&server, SERVER, Ready::readable(), PollOpt::level()).unwrap();
 
         info!("[WORKER {}] running on port 6262", worker.index());
@@ -109,17 +116,18 @@ fn main() {
             // commands consumed, in order to ensure timely progress
             // on registered queues
 
-            std::io::stdout().flush().unwrap();
-            std::io::stderr().flush().unwrap();
+            trace!("looping");
 
-            println!("looping");
-            
             // handle clients
-            
-            poll.poll(&mut events, Some(Duration::from_millis(500))).unwrap(); // @TODO handle errors
+
+            // @TODO 0 timeout (but can use this for artificial braking)
+            // @TODO handle errors
+            poll.poll(&mut events, Some(Duration::from_millis(0))).unwrap();
 
             for event in events.iter() {
 
+                trace!("[WORKER {}] recv event on {:?}", worker.index(), event.token());
+                
                 match event.token() {
                     SERVER => {
                         if event.readiness().is_readable() {
@@ -157,6 +165,43 @@ fn main() {
                             }
                         }
                     },
+                    RESULTS => {
+                        while let Ok((query_name, results)) = recv_results.try_recv() {
+
+                            info!("[WORKER {}] {:?} {:?}", worker.index(), query_name, results);
+
+                            match interests.get(&query_name) {
+                                None => { /* @TODO unregister this flow */ },
+                                Some(tokens) => {
+                                    let serialized = serde_json::to_string::<(String, Vec<Out>)>(&(query_name, results))
+                                        .expect("failed to serialize outputs");
+                                    let msg = ws::Message::text(serialized);
+
+                                    for &token in tokens.iter() {
+                                        // @TODO check whether connection still exists
+                                        let conn = &mut connections[token.into()];
+                                        info!("[WORKER {}] sending msg {:?}", worker.index(), msg);
+
+                                        conn.send_message(msg.clone()).expect("failed to send message");
+
+                                        poll.reregister(
+                                            conn.socket(),
+                                            conn.token(),
+                                            conn.events(),
+                                            PollOpt::edge() | PollOpt::oneshot(),
+                                        ).unwrap();
+                                    }
+                                }
+                            }                                                
+                        }
+
+                        poll.reregister(
+                            &recv_results,
+                            RESULTS,
+                            Ready::readable(),
+                            PollOpt::edge() | PollOpt::oneshot()
+                        ).unwrap();
+                    },
                     _ => {
                         let token = event.token();
                         let active = {
@@ -181,6 +226,7 @@ fn main() {
                                                     let command = Command {
                                                         id: 0, // @TODO command ids?
                                                         owner: worker.index(),
+                                                        client: token.into(),
                                                         cmd: msg.into_text().unwrap()
                                                     };
 
@@ -241,7 +287,7 @@ fn main() {
             while let Some(command) = sequencer.next() {
 
                 match serde_json::from_str::<Request>(&command.cmd) {
-                    Err(msg) => { error!("failed to parse command: {:?}", msg); },
+                    Err(msg) => { panic!("failed to parse command: {:?}", msg); },
                     Ok(req) => {
 
                         info!("[WORKER {}] {:?}", worker.index(), req);
@@ -258,7 +304,21 @@ fn main() {
                             },
                             Request::Register { query_name, plan, rules } => {
 
+                                if command.owner == worker.index() {
+
+                                    // we are the owning worker and thus have to
+                                    // keep track of this client's new interest
+                                    
+                                    let client_token = Token(command.client);
+                                    interests.entry(query_name.clone())
+                                        .or_insert(Vec::new())
+                                        .push(client_token);
+                                }
+
+                                let send_results_handle = send_results.clone();
+
                                 worker.dataflow::<usize, _, _>(|scope| {
+
                                     let mut rel_map = register(scope, &mut ctx, &query_name, plan, rules);
 
                                     let probe = rel_map.get_mut(&query_name).unwrap().trace.import(scope)
@@ -270,16 +330,18 @@ fn main() {
                                             "OutputsRecv", 
                                             Vec::new(),
                                             move |input, _output: &mut OutputHandle<_, Out, _>, _notificator| {
+                                                
+                                                // due to the exchange pact, this closure is only
+                                                // executed by the owning worker
 
                                                 input.for_each(|_time, data| {
-                                                    // @TODO send outputs
-                                                    // let out: Vec<Out> = data.drain(..).collect();
-                                                    // send_results.send((query_name.clone(), out));
+                                                    let out: Vec<Out> = data.to_vec();
+                                                    send_results_handle.send((query_name.clone(), out)).unwrap();
                                                 });
                                             })
                                         .probe();
 
-                                    ctx.probes.push(probe);
+                                    probes.push(probe);
                                 });
                             }
                         }
@@ -287,14 +349,13 @@ fn main() {
                 }
             }
 
-            if ctx.probes.is_empty() {
-                // ensure loop continues while no queries registered
-                worker.step();
-            } else {
-                for probe in &mut ctx.probes {
-                    while probe.less_than(ctx.input_handle.time()) {
-                        worker.step();
-                    }
+            // ensure work continues, even if no queries registered,
+            // s.t. the sequencer continues issuing commands
+            worker.step();
+            
+            for probe in &mut probes {
+                while probe.less_than(ctx.input_handle.time()) {
+                    worker.step();
                 }
             }
         }
