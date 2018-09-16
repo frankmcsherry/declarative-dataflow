@@ -14,9 +14,11 @@ serde_derive = "1"
 serde_json = "1"
 mio = "0.6.16"
 slab = "0.4.1"
-ws = { path = "../ws-rs/" }
+# ws = { path = "../ws-rs/" }
+ws = { git = "https://github.com/comnik/ws-rs" }
 log = "0.4"
 env_logger = "0.5.6"
+getopts = "0.2.18"
 
 [profile.release]
 opt-level = 3
