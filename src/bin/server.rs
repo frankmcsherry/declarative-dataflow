@@ -5,6 +5,7 @@ extern crate serde_json;
 extern crate mio;
 extern crate slab;
 extern crate ws;
+extern crate getopts;
 
 #[macro_use]
 extern crate log;
@@ -17,9 +18,13 @@ extern crate abomonation;
 #[macro_use]
 extern crate serde_derive;
 
+use std::{thread, usize};
 use std::collections::{HashMap};
+use std::io::{BufRead};
+use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::time::{Instant, Duration};
-use std::usize;
+
+use getopts::Options;
 
 use timely::dataflow::operators::{Probe, Map, Operator};
 use timely::dataflow::operators::generic::{OutputHandle};
@@ -36,6 +41,12 @@ use declarative_server::{Context, Plan, Rule, TxData, Out, Datom, setup_db, regi
 mod sequencer;
 use sequencer::{Sequencer};
 
+#[derive(Debug)]
+struct Config {
+    port: u16,
+    enable_cli: bool,
+}
+
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Abomonation, Debug)]
 struct Command {
     id: usize,
@@ -44,7 +55,7 @@ struct Command {
     owner: usize,
     // the client token that issued the command (only relevant to the
     // owning worker, no one else has the connection)
-    client: usize,
+    client: Option<usize>,
     cmd: String,
 }
 
@@ -57,12 +68,32 @@ enum Request {
 
 const SERVER: Token = Token(usize::MAX - 1);
 const RESULTS: Token = Token(usize::MAX - 2);
+const CLI: Token = Token(usize::MAX - 3);
 
 fn main() {
 
     env_logger::init();
 
-    timely::execute_from_args(std::env::args(), move |worker| {
+    let mut opts = Options::new();
+    opts.optopt("", "port", "server port", "PORT");
+    opts.optflag("", "enable-cli", "enable the CLI interface");
+
+    let args: Vec<String> = std::env::args().collect();
+    let timely_args = std::env::args().take_while(|ref arg| arg.to_string() != "--");
+
+    timely::execute_from_args(timely_args, move |worker| {
+
+        // read configuration
+        let server_args = args.iter().rev().take_while(|arg| arg.to_string() != "--");
+        let config = match opts.parse(server_args) {
+            Err(err) => panic!(err),
+            Ok(matches) => {
+                Config {
+                    port: matches.opt_str("port").map(|x| x.parse().unwrap_or(6262)).unwrap_or(6262),
+                    enable_cli: matches.opt_present("enable-cli")
+                }
+            }
+        };
 
         // setup interpreter context
         let mut ctx = worker.dataflow(|scope| {
@@ -84,11 +115,14 @@ fn main() {
             .. ws::Settings::default()
         };
 
+        // setup CLI channel
+        let (send_cli, recv_cli) = mio::channel::channel();
+
         // setup results channel
         let (send_results, recv_results) = mio::channel::channel();
         
         // setup server socket
-        let addr = "127.0.0.1:6262".parse().unwrap();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), config.port);
         let server = TcpListener::bind(&addr).unwrap();
         let mut connections = Slab::with_capacity(ws_settings.max_connections);
         let mut next_connection_id: u32 = 0;
@@ -97,10 +131,24 @@ fn main() {
         let poll = Poll::new().unwrap();
         let mut events = Events::with_capacity(1024);
 
+        if config.enable_cli {
+            poll.register(&recv_cli, CLI, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+
+            thread::spawn(move || {
+
+                info!("[CLI] accepting cli commands");
+                
+                let input = std::io::stdin();
+                while let Some(line) = input.lock().lines().map(|x| x.unwrap()).next() {
+                    send_cli.send(line.to_string()).expect("failed to send command");
+                }
+            });
+        }
+        
         poll.register(&recv_results, RESULTS, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         poll.register(&server, SERVER, Ready::readable(), PollOpt::level()).unwrap();
 
-        info!("[WORKER {}] running on port 6262", worker.index());
+        info!("[WORKER {}] running with config {:?}", worker.index(), config);
         
         loop {
             
@@ -128,6 +176,21 @@ fn main() {
                 trace!("[WORKER {}] recv event on {:?}", worker.index(), event.token());
                 
                 match event.token() {
+                    CLI => {
+                        while let Ok(cli_input) = recv_cli.try_recv() {
+                            let command = Command {
+                                id: 0, // @TODO command ids?
+                                owner: worker.index(),
+                                client: None,
+                                cmd: cli_input
+                            };
+
+                            sequencer.push(command);
+                        }
+
+                        poll.reregister(&recv_cli, CLI, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())
+                            .unwrap();
+                    },
                     SERVER => {
                         if event.readiness().is_readable() {
                             // new connection arrived on the server socket
@@ -225,7 +288,7 @@ fn main() {
                                                     let command = Command {
                                                         id: 0, // @TODO command ids?
                                                         owner: worker.index(),
-                                                        client: token.into(),
+                                                        client: Some(token.into()),
                                                         cmd: msg.into_text().unwrap()
                                                     };
 
@@ -307,11 +370,16 @@ fn main() {
 
                                     // we are the owning worker and thus have to
                                     // keep track of this client's new interest
-                                    
-                                    let client_token = Token(command.client);
-                                    interests.entry(query_name.clone())
-                                        .or_insert(Vec::new())
-                                        .push(client_token);
+
+                                    match command.client {
+                                        None => { },
+                                        Some(client) => {
+                                            let client_token = Token(client);
+                                            interests.entry(query_name.clone())
+                                                .or_insert(Vec::new())
+                                                .push(client_token);
+                                        }
+                                    }
                                 }
 
                                 let send_results_handle = send_results.clone();
@@ -410,33 +478,6 @@ fn main() {
 //     next_tx = next_tx + 1;
 //     ctx.input_handle.advance_to(next_tx);
 //     ctx.input_handle.flush();
-// }
-
-// fn run_cli_server(command_channel: Sender<String>, results_channel: Receiver<(String, Vec<Out>)>) {
-
-//     stdout().flush().unwrap();
-//     let input = stdin();
-
-//     Command { id: 0, owner: self.worker_idx, cmd: input }
-
-
-//     thread::spawn(move || {
-//         loop {
-//             match results_channel.recv() {
-//                 Err(_err) => break,
-//                 Ok((query_name, results)) => { println!("=> {:?} {:?}", query_name, results) }
-//             };
-//         }
-//     });
-    
-//     loop {
-//         if let Some(line) = input.lock().lines().map(|x| x.unwrap()).next() {
-//             match line.as_str() {
-//                 "exit" => { break },
-//                 _ => { command_channel.send(line).expect("failed to send command"); },
-//             }
-//         }
-//     }
 // }
 
 // fn run_tcp_server(command_channel: Sender<String>, results_channel: Receiver<(String, Vec<Out>)>) {
