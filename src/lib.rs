@@ -663,22 +663,3 @@ pub fn register<A: Allocate, T: Timestamp+Lattice>(
     
     result_map
 }
-
-// @TODO this is probably only neccessary in the WASM interface
-//
-// pub fn transact<A: Allocate>(ctx: &mut Context<A, usize>, tx: usize, d: Vec<TxData>) -> bool {
-//     for TxData(op, e, a, v) in d {
-//         ctx.input_handle.update(Datom(e, a, v), op);
-//     }
-//     ctx.input_handle.advance_to(tx + 1);
-//     ctx.input_handle.flush();
-
-//     for probe in &mut ctx.probes {
-//         while probe.less_than(ctx.input_handle.time()) {
-//             ctx.root.step();
-//         }
-//     }
-
-//     true
-// }
-
