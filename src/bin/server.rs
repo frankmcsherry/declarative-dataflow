@@ -116,11 +116,10 @@ fn main() {
             // commands consumed, in order to ensure timely progress
             // on registered queues
 
-            trace!("looping");
-
-            // handle clients
-
-            // @TODO 0 timeout (but can use this for artificial braking)
+            // polling - should usually be driven completely
+            // non-blocking (i.e. timeout 0), but higher timeouts can
+            // be used for debugging or artificial braking
+            //
             // @TODO handle errors
             poll.poll(&mut events, Some(Duration::from_millis(0))).unwrap();
 
